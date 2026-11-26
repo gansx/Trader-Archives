@@ -18,10 +18,6 @@ on:
     - cron: "10 20 * * *"
   workflow_dispatch:
     inputs:
-      force_channel_check:
-        description: "强制验证 git push 通道（打空提交）"
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -44,7 +40,6 @@ jobs:
         id: cmp
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORCE_CHANNEL_CHECK: ${{ inputs.force_channel_check }}
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
@@ -87,10 +82,6 @@ jobs:
           else
             echo "need_sync=true" >> "$GITHUB_OUTPUT"
           fi
-          if [ "$FORCE_CHANNEL_CHECK" = "true" ]; then
-            echo "need_sync=true" >> "$GITHUB_OUTPUT"
-            echo "force_channel_check=true — git push channel will be exercised."
-          fi
 
       - name: Server-side merge (merge-upstream API)
         # 服务端直接合并，不传输任何仓库数据。
@@ -132,9 +123,7 @@ jobs:
         # 仅当 merge-upstream 返回 409 时进入。
         # 做法：把 fork main 对齐到上游 head，再把 fork 独有的文件重放一次提交。
         # blob:none + cone sparse-checkout 只为 .github 取内容，不落 900MB 工作区。
-        if: |
-          steps.api.outputs.result == 'conflict' ||
-          (steps.cmp.outputs.need_sync == 'true' && inputs.force_channel_check == true)
+        if: steps.api.outputs.result == 'conflict'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -176,14 +165,7 @@ jobs:
           echo "fork-only files:$FORK_ONLY"
 
           if git merge-base --is-ancestor "$UP_HEAD" HEAD && [ -z "$FORK_ONLY" ]; then
-            if [ "${{ inputs.force_channel_check }}" = "true" ]; then
-              git commit -q --allow-empty -m "ci: verify upstream sync push channel"
-              git push -q --force-with-lease="refs/heads/$UPSTREAM_BRANCH:$OLD_HEAD" \
-                origin "HEAD:refs/heads/$UPSTREAM_BRANCH"
-              echo "Push channel verified (empty commit)."
-            else
-              echo "Already aligned with upstream; nothing to do."
-            fi
+            echo "Already contains upstream head and has no fork-only files; nothing to do."
             exit 0
           fi
 
@@ -230,6 +212,46 @@ jobs:
           git commit -q --allow-empty -m "ci: keepalive (no upstream change for ${AGE_DAYS}d)"
           git push -q origin "HEAD:refs/heads/$UPSTREAM_BRANCH"
           echo "Keepalive commit pushed."
+
+      - name: Check Pages rebuilt
+        # GITHUB_TOKEN 推送的提交不会触发其他 workflow，但 Pages 走 legacy 构建
+        # （dynamic 事件）时仍会重建。这里如实报告，避免站点内容与 main 脱节而无人察觉。
+        if: steps.cmp.outputs.need_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          REPO="${{ github.repository }}"
+
+          HAS_PAGES=$(gh api "repos/$REPO/pages" -q '.status' 2>/dev/null || echo "none")
+          if [ "$HAS_PAGES" = "none" ]; then
+            echo "Pages not enabled on this repo; skipping."
+            exit 0
+          fi
+
+          echo "Pages status: $HAS_PAGES"
+          for _ in $(seq 1 20); do
+            ST=$(gh api "repos/$REPO/pages/builds" -q '.[0].status' 2>/dev/null || echo unknown)
+            echo "  build status: $ST"
+            [ "$ST" = "built" ] && break
+            [ "$ST" = "errored" ] && break
+            sleep 15
+          done
+
+          LAST=$(gh api "repos/$REPO/pages/builds" -q '.[0] | "\(.status) at \(.created_at)"' 2>/dev/null || echo "unknown")
+          {
+            echo ""
+            echo "### Pages"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| site | ${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/ |"
+            echo "| latest build | $LAST |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ST" = "errored" ]; then
+            echo "::warning::Latest Pages build errored; site may be stale."
+          fi
 
       - name: Verify fork caught up
         env:
