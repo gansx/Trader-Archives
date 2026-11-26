@@ -1,0 +1,277 @@
+name: Sync Upstream
+
+# 每天把 suoha888/Trader-Archives 的 main 同步进本 fork。
+#
+# 本 fork 带有自有提交（本工作流文件），所以上游一更新，两侧必然 diverged。
+# 同步按成本从低到高：
+#   1. 上游 head 已是祖先       → 无事可做
+#   2. merge-upstream API       → 服务端直接合并，零数据传输，无冲突时必然成功
+#   3. merge-upstream 报 409 冲突 → sparse checkout 只取 .github，
+#                                  将 fork main 对齐到上游 head（数据以上游为准），
+#                                  再把上游不存在的 fork 自有文件重放一次提交，
+#                                  最后 force-with-lease 推送
+# 全程不 checkout 894MB 工作区。
+
+on:
+  schedule:
+    # UTC 20:10 == 北京时间 04:10，避开上游 05:xx 的推送高峰
+    - cron: "10 20 * * *"
+  workflow_dispatch:
+    inputs:
+      force_channel_check:
+        description: "强制验证 git push 通道（打空提交）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: suoha888/Trader-Archives
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    name: sync upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Inspect fork vs upstream
+        id: cmp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_CHANNEL_CHECK: ${{ inputs.force_channel_check }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+
+          ACTUAL_UP=$(gh api "repos/$REPO" -q '.parent.full_name // empty')
+          if [ "$ACTUAL_UP" != "$UPSTREAM_REPO" ]; then
+            echo "::error::Fork parent is '${ACTUAL_UP:-<none>}', expected '$UPSTREAM_REPO'."
+            exit 1
+          fi
+
+          UP_SHA=$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH" -q .sha)
+          MY_SHA=$(gh api "repos/$REPO/commits/$UPSTREAM_BRANCH" -q .sha)
+          UP_DATE=$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH" -q '.commit.committer.date')
+
+          if [ "$UP_SHA" = "$MY_SHA" ]; then
+            STATUS=identical; AHEAD=0; BEHIND=0
+          else
+            CMP=$(gh api "repos/$REPO/compare/${UP_SHA}...${MY_SHA}")
+            STATUS=$(jq -r .status  <<<"$CMP")
+            AHEAD=$(jq -r .ahead_by  <<<"$CMP")
+            BEHIND=$(jq -r .behind_by <<<"$CMP")
+          fi
+
+          {
+            echo "up_sha=$UP_SHA"
+            echo "my_sha=$MY_SHA"
+            echo "up_date=$UP_DATE"
+            echo "status=$STATUS"
+            echo "ahead=$AHEAD"
+            echo "behind=$BEHIND"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "upstream : $UPSTREAM_REPO@$UPSTREAM_BRANCH"
+          echo "up head  : $UP_SHA  ($UP_DATE)"
+          echo "fork head: $MY_SHA"
+          echo "compare  : status=$STATUS ahead=$AHEAD behind=$BEHIND"
+
+          if [ "$STATUS" = "identical" ] || [ "$STATUS" = "ahead" ]; then
+            echo "need_sync=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$FORCE_CHANNEL_CHECK" = "true" ]; then
+            echo "need_sync=true" >> "$GITHUB_OUTPUT"
+            echo "force_channel_check=true — git push channel will be exercised."
+          fi
+
+      - name: Server-side merge (merge-upstream API)
+        # 服务端直接合并，不传输任何仓库数据。
+        # gh api 在 409 时返回非零退出码，因此用输出文本判定，不依赖 HTTP 解析。
+        id: api
+        if: |
+          steps.cmp.outputs.need_sync == 'true' &&
+          steps.cmp.outputs.status != 'ahead'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Actions 默认用 `bash -e` 执行，命令替换失败会直接终止脚本；
+        # 因此用 if 形式捕获退出码，不能写成 `OUT=$(cmd); RC=$?`。
+        run: |
+          set -uo pipefail
+          REPO="${{ github.repository }}"
+
+          if OUT=$(gh api -X POST "repos/$REPO/merge-upstream" \
+                     -f branch="$UPSTREAM_BRANCH" 2>&1); then
+            RC=0
+          else
+            RC=$?
+          fi
+          echo "$OUT"
+          echo "exit=$RC"
+
+          if [ "$RC" -eq 0 ]; then
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            echo "Server-side merge succeeded; no data transferred."
+          elif [[ "$OUT" == *"merge conflicts"* ]]; then
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::Upstream merge conflicts; will realign with git (upstream wins)."
+          else
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            echo "::error::merge-upstream failed unexpectedly (exit $RC)"
+            exit 1
+          fi
+
+      - name: Hard-align to upstream (only when server merge is blocked)
+        # 仅当 merge-upstream 返回 409 时进入。
+        # 做法：把 fork main 对齐到上游 head，再把 fork 独有的文件重放一次提交。
+        # blob:none + cone sparse-checkout 只为 .github 取内容，不落 900MB 工作区。
+        if: |
+          steps.api.outputs.result == 'conflict' ||
+          (steps.cmp.outputs.need_sync == 'true' && inputs.force_channel_check == true)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          WT="$RUNNER_TEMP/sync"
+          OWN="$RUNNER_TEMP/fork-only"
+          AUTH="https://x-access-token:${GH_TOKEN}@github.com"
+
+          git init -q "$WT"
+          cd "$WT"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "$AUTH/${REPO}.git"
+          git remote add up     "$AUTH/${UPSTREAM_REPO}.git"
+
+          git sparse-checkout init --cone
+          git sparse-checkout set .github
+
+          git fetch -q --filter=blob:none --no-tags origin "$UPSTREAM_BRANCH"
+          git checkout -q -B "$UPSTREAM_BRANCH" FETCH_HEAD
+          OLD_HEAD=$(git rev-parse HEAD)
+          echo "fork head: $OLD_HEAD"
+
+          # 备份 fork 侧 .github，稍后把上游没有的文件重放回去
+          rm -rf "$OWN"; mkdir -p "$OWN"
+          [ -d .github ] && cp -a .github "$OWN"/
+
+          git fetch -q --filter=blob:none --no-tags up "$UPSTREAM_BRANCH"
+          UP_HEAD=$(git rev-parse FETCH_HEAD)
+          echo "upstream head: $UP_HEAD"
+
+          # 收集 fork 独有（上游树里不存在）的文件
+          FORK_ONLY=""
+          while IFS= read -r f; do
+            rel="${f#$OWN/}"
+            git cat-file -e "$UP_HEAD:$rel" 2>/dev/null || FORK_ONLY="$FORK_ONLY $rel"
+          done < <(find "$OWN" -type f 2>/dev/null)
+          echo "fork-only files:$FORK_ONLY"
+
+          if git merge-base --is-ancestor "$UP_HEAD" HEAD && [ -z "$FORK_ONLY" ]; then
+            if [ "${{ inputs.force_channel_check }}" = "true" ]; then
+              git commit -q --allow-empty -m "ci: verify upstream sync push channel"
+              git push -q --force-with-lease="refs/heads/$UPSTREAM_BRANCH:$OLD_HEAD" \
+                origin "HEAD:refs/heads/$UPSTREAM_BRANCH"
+              echo "Push channel verified (empty commit)."
+            else
+              echo "Already aligned with upstream; nothing to do."
+            fi
+            exit 0
+          fi
+
+          # 对齐到上游，保证数据湖与上游完全一致
+          git reset -q --hard "$UP_HEAD"
+
+          if [ -n "$FORK_ONLY" ]; then
+            for rel in $FORK_ONLY; do
+              mkdir -p "$(dirname "$rel")"
+              cp -a "$OWN/$rel" "$rel"
+            done
+            git add -A -- .
+            git commit -q -m "ci: reapply fork-only github files on upstream ${UP_HEAD:0:7}"
+          fi
+
+          # 本分支历史被重写，必须 force；lease 限定为同步前的 head，防并发覆盖
+          git push -q --force-with-lease="refs/heads/$UPSTREAM_BRANCH:$OLD_HEAD" \
+            origin "HEAD:refs/heads/$UPSTREAM_BRANCH"
+          echo "Fork main realigned onto upstream $UP_HEAD"
+
+      - name: Keep scheduled workflow from being auto-disabled
+        # GitHub 在仓库连续 60 天无活动后会停用定时工作流。
+        # 上游长期不更新时，用空提交续命，避免 cron 被静默停掉。
+        if: steps.cmp.outputs.need_sync != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          LAST=$(gh api "repos/$REPO/commits/$UPSTREAM_BRANCH" -q '.commit.committer.date')
+          AGE_DAYS=$(( ( $(date -u +%s) - $(date -u -d "$LAST" +%s) ) / 86400 ))
+          echo "last fork commit: $LAST (${AGE_DAYS}d ago)"
+          if [ "$AGE_DAYS" -lt 30 ]; then
+            echo "Recent activity exists; keepalive skipped."
+            exit 0
+          fi
+          WT="$RUNNER_TEMP/keepalive"
+          git init -q "$WT" && cd "$WT"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git fetch -q --depth 1 origin "$UPSTREAM_BRANCH"
+          git checkout -q -B "$UPSTREAM_BRANCH" FETCH_HEAD
+          git commit -q --allow-empty -m "ci: keepalive (no upstream change for ${AGE_DAYS}d)"
+          git push -q origin "HEAD:refs/heads/$UPSTREAM_BRANCH"
+          echo "Keepalive commit pushed."
+
+      - name: Verify fork caught up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          REPO="${{ github.repository }}"
+          UP_SHA="${{ steps.cmp.outputs.up_sha }}"
+          MY_SHA="${{ steps.cmp.outputs.my_sha }}"
+          NEED="${{ steps.cmp.outputs.need_sync }}"
+          BEHIND=0
+
+          if [ "$NEED" = "true" ]; then
+            for _ in $(seq 1 24); do
+              BEHIND=$(gh api "repos/$REPO/compare/${UP_SHA}...$UPSTREAM_BRANCH" -q .behind_by 2>/dev/null || echo 1)
+              [ "$BEHIND" = "0" ] && break
+              sleep 10
+            done
+          fi
+
+          CUR=$(gh api "repos/$REPO/commits/$UPSTREAM_BRANCH" -q .sha)
+          {
+            echo "## Trader-Archives upstream sync"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| upstream | \`$UPSTREAM_REPO\` |"
+            echo "| upstream head | \`$UP_SHA\` |"
+            echo "| upstream last commit | ${{ steps.cmp.outputs.up_date }} |"
+            echo "| compare before | \`${{ steps.cmp.outputs.status }}\` (ahead ${{ steps.cmp.outputs.ahead }} / behind ${{ steps.cmp.outputs.behind }}) |"
+            echo "| path taken | \`${{ steps.api.outputs.result || 'git-merge' }}\` |"
+            echo "| fork head before | \`$MY_SHA\` |"
+            echo "| fork head after | \`$CUR\` |"
+            echo "| still behind by | $BEHIND |"
+            echo "| checked at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$NEED" != "true" ]; then
+            echo "Already up to date with upstream."
+          elif [ "$BEHIND" != "0" ]; then
+            echo "::error::fork is still behind upstream by $BEHIND commit(s)."
+            exit 1
+          else
+            echo "Fork contains upstream head $UP_SHA; fork head is $CUR."
+          fi
